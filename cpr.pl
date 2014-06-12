@@ -1,5 +1,18 @@
 #!/usr/bin/env perl
 
+# Name:         cpr.pl
+# Version:      0.2.9
+# Release:      1
+# License:      CC-BA (Creative Commons By Attrbution)
+#               http://creativecommons.org/licenses/by/4.0/legalcode
+# Group:        Reporting
+# Source:       N/A
+# URL:          https://github.com/richardatlateralblast/cpr
+# Distribution: Solaris/Linux
+# Vendor:       Lateral Blast
+# Packager:     Richard Spindler <richard@lateralblast.com.au>
+# Description:  Script to produce a consolidated patch report
+
 use strict;
 use Spreadsheet::ParseExcel;
 use Getopt::Std;
@@ -10,18 +23,6 @@ use Switch;
 use Text::Iconv;
 use Spreadsheet::XLSX;
 use Text::CSV;
-
-# Name:         cpr.pl
-# Version:      0.2.9
-# Release:      1
-# License:      Open Source
-# Group:        Reporting
-# Source:       N/A
-# URL:          https://github.com/richardatlateralblast/cpr
-# Distribution: Solaris/Linux
-# Vendor:       Lateral Blast
-# Packager:     Richard Spindler <richard@lateralblast.com.au>
-# Description:  Script to produce a consolidated patch report
 
 # Script variables
 
