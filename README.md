@@ -112,14 +112,14 @@ The first time the report is run it will take a little longer as it imports the 
 To generate a consolidated patch report of all Operating Systems and environments:
 
 ```
-$ ./cpr.pl -a
+$ cpr.pl -a
 Generating xls/all_report.xlsx
 ```
 
 To generate a summarised consolidated patch report for everything (this will hide the worksheets for individual operating systems):
 
 ```
-$ ./cpr.pl -a -S
+$ cpr.pl -a -S
 Generating xls/summary_report.xlsx
 ```
 
@@ -127,35 +127,35 @@ Generating xls/summary_report.xlsx
 To produce a traditional percentage based report of everything:
 
 ```
-$ ./cpr.pl -a -S -t
+$ cpr.pl -a -S -t
 Generating xls/summary_report.xlsx
 ```
 
 To generate a report that includes Windows information only:
 
 ```
-$ ./cpr.pl -w
+$ cpr.pl -w
 Generating xls/windows_report.xlsx
 ```
 
 To generate a report that include Linux information only:
 
 ```
-$ ./cpr.pl -l
+$ cpr.pl -l
 Generating xls/linux_report.xlsx
 ```
 
 To generate a report that includes Solaris information only:
 
 ```
-$ ./cpr.pl -s
+$ cpr.pl -s
 Generating xls/solaris_report.xlsx
 ```
 
 To generate a report that includes PCI information only:
 
 ```
-$ ./cpr.pl -p
+$ cpr.pl -p
 Generating xls/pci_report.xlsx
 ```
 
