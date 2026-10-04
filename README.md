@@ -18,12 +18,24 @@ A perl script that takes information from the sources like the following to crea
 
 It can me modified to run with more or less sources. It processes the source information into dated files so that trending information can be charted, such as whether patching rates are improving. It also supports reporting on environments based on hostname and CMDB information.
 
+Version
+-------
+
+Current version: 0.6.1
+
+See [CHANGELOG.md](CHANGELOG.md) for the list of changes.
+
 License
 -------
 
-CC BY-SA: https://creativecommons.org/licenses/by-sa/4.0/
+CC BY-NC-SA 4.0: https://creativecommons.org/licenses/by-nc-sa/4.0/
 
-Fund me here: https://ko-fi.com/richardatlateralblast
+Help Support Development
+------------------------
+
+If you find this software useful and would like to support its development, please consider buying me a coffee:
+
+https://ko-fi.com/richardatlateralblast
 
 Directory Structure
 -------------------
@@ -38,9 +50,9 @@ raw/index.html           (Current PCA HTML report)
 raw/wintel_latest.csv    (Current Windows WSUS report)
 raw/cmdb.csv             (Current CMDB extract)
 raw/master_list.xls      (Current Server Master List)
-old/download.csv.MMYYYY  (Archived Red Hat Satellite CSV)
-old/index.html.MMYYYY    (Archived PCA HTML report)
-old/wintel_latest.MMYYYY (Archived Windows WSUS report)
+old/download.csv_MM_YYYY  (Archived Red Hat Satellite CSV)
+old/index.html_MM_YYYY    (Archived PCA HTML report)
+old/wintel_latest.csv_MM_YYYY (Archived Windows WSUS report)
 cpr/sol_MM_YYYY          (Solaris Monthly Patch Information)
 cpr/sol_all              (All Solaris Monthly Patch Information)
 cpr/lin_MM_YYYY          (Linux Monthly Patch Information)

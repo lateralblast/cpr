@@ -1,10 +1,10 @@
 #!/usr/bin/env perl
 
 # Name:         cpr.pl
-# Version:      0.2.9
+# Version:      0.6.1
 # Release:      1
-# License:      CC-BA (Creative Commons By Attrbution)
-#               http://creativecommons.org/licenses/by/4.0/legalcode
+# License:      CC BY-NC-SA 4.0 (Creative Commons Attribution-NonCommercial-ShareAlike)
+#               https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
 # Group:        Reporting
 # Source:       N/A
 # URL:          https://github.com/richardatlateralblast/cpr
@@ -14,12 +14,85 @@
 # Description:  Script to produce a consolidated patch report
 
 use strict;
+use warnings;
+
+# Install any required modules that are missing
+# This runs at compile time, before the modules below are loaded
+# It uses cpanm if available, otherwise cpan, and needs network access
+# (and a compiler for XS modules such as Text::Iconv)
+
+BEGIN {
+  # Module to check => CPAN distribution/module to install
+  my %required=(
+    "Spreadsheet::ParseExcel" => "Spreadsheet::ParseExcel",
+    "HTML::TokeParser"        => "HTML::Parser",
+    "Excel::Writer::XLSX"     => "Excel::Writer::XLSX",
+    "Text::Iconv"             => "Text::Iconv",
+    "Spreadsheet::XLSX"       => "Spreadsheet::XLSX",
+    "Text::CSV"               => "Text::CSV",
+  );
+  my @missing;
+  my $module;
+  my $installer;
+  my @command;
+  # Pick up modules from a previous non-root install
+  my $local_lib="$ENV{HOME}/perl5";
+  foreach my $dir ("$local_lib/lib/perl5") {
+    if ((-d $dir)&&(!grep { $_ eq $dir } @INC)) {
+      unshift(@INC,$dir);
+    }
+  }
+  foreach $module (sort(keys(%required))) {
+    (my $file="$module.pm")=~s{::}{/}g;
+    if (!eval { require $file; 1 }) {
+      push(@missing,$module);
+    }
+  }
+  if (@missing) {
+    print "Missing Perl modules: ".join(", ",@missing)."\n";
+    ($installer)=grep { -x "$_/cpanm" } split(/:/,$ENV{PATH});
+    if ($installer) {
+      @command=("$installer/cpanm","--notest");
+    }
+    else {
+      ($installer)=grep { -x "$_/cpan" } split(/:/,$ENV{PATH});
+      if (!$installer) {
+        die "Neither cpanm nor cpan found, please install: ".join(" ",map { $required{$_} } @missing)."\n";
+      }
+      @command=("$installer/cpan","-T");
+      $ENV{PERL_MM_USE_DEFAULT}=1;
+    }
+    foreach $module (@missing) {
+      print "Installing $required{$module}\n";
+      system(@command,$required{$module});
+    }
+    # A non-root install may have gone into ~/perl5
+    foreach my $dir ("$local_lib/lib/perl5") {
+      if ((-d $dir)&&(!grep { $_ eq $dir } @INC)) {
+        unshift(@INC,$dir);
+      }
+    }
+    my @failed;
+    foreach $module (@missing) {
+      (my $file="$module.pm")=~s{::}{/}g;
+      if (!eval { require $file; 1 }) {
+        push(@failed,$required{$module});
+      }
+    }
+    if (@failed) {
+      die "Unable to install: ".join(", ",@failed)."\nPlease install them manually, e.g. cpanm --installdeps .\n";
+    }
+  }
+}
+
 use Spreadsheet::ParseExcel;
 use Getopt::Std;
+use File::Basename;
+use File::Copy;
+use POSIX qw(strftime);
 use HTML::TokeParser;
 use Excel::Writer::XLSX;
 use Time::Piece;
-use Switch;
 use Text::Iconv;
 use Spreadsheet::XLSX;
 use Text::CSV;
@@ -27,10 +100,9 @@ use Text::CSV;
 # Script variables
 
 my $script_name=$0;
-my $script_version=`cat $script_name | grep '^# Version' |awk '{print \$3}'`;
+my $script_version=get_script_version();
 my $options="achlpstwvSVi:L:P:";
 my %option;
-my $report_file="xls/report.xlsx";
 my $logo_img="img/company_name.png";
 my $company="Company Name Pty Ltd";
 my $title="Consolidated Patch Report";
@@ -81,11 +153,50 @@ my @all_wsus_data;
 my @all_cpr_data;
 my $run_date;
 my @patch_info;
+my %patch_seen;
 
 # OS and Environments
 
 my @os_names=("Windows", "Linux", "Solaris");
 my @env_names=("PCI", "Prod", "Dev", "Test", "Unknown");
+
+# Rules for working out an environment, first matching rule wins
+
+my @master_env_rules=(
+  [ qr/PROD/, "Prod" ],
+  [ qr/TEST/, "Test" ],
+  [ qr/DEV/,  "Dev" ],
+);
+
+my @host_env_rules=(
+  [ qr/prod|p[0-9]|o[0-9]|cd[0-9]|wp/,   "Prod" ],
+  [ qr/ora[0-9]|apps[0-9]|appdb[0-9]/,   "Prod" ],
+  [ qr/fin[0-9]|mon[0-9]|ninja|dp[0-9]/, "Prod" ],
+  [ qr/cvs[0-9]|tax[0-9]/,               "Prod" ],
+  [ qr/dev|da[0-9]|do[0-9]|dd[0-9]/,     "Dev" ],
+  [ qr/lab[0-9]|pd[0-9]/,                "Dev" ],
+  [ qr/test|ta[0-9]|to[0-9]|wu/,         "Test" ],
+);
+
+my @cmdb_env_rules=(
+  [ qr/\bdr\b|(?<!non-)(?<!non )prod/, "Prod" ],
+  [ qr/dev/,                           "Dev" ],
+  [ qr/test/,                          "Test" ],
+);
+
+# Rules for working out a worksheet name prefix from a file name
+
+my @worksheet_prefix_rules=(
+  [ qr/xpr_/,      "All Platforms" ],
+  [ qr/win_all/,   "All Windows" ],
+  [ qr/lin_all/,   "All Linux" ],
+  [ qr/sol_all/,   "All Solaris" ],
+  [ qr/pci_all/,   "All PCI" ],
+  [ qr/win_[0-9]/, "Windows" ],
+  [ qr/lin_[0-9]/, "Linux" ],
+  [ qr/sol_[0-9]/, "Solaris" ],
+  [ qr/pci_[0-9]/, "PCI" ],
+);
 
 # Headers
 
@@ -115,6 +226,7 @@ my $wsus_csv="raw/wintel_latest.csv";
 
 if ($#ARGV == -1) {
   print_usage();
+  exit;
 }
 else {
   getopts($options,\%option);
@@ -152,6 +264,22 @@ if ($option{'P'}) {
 #
 
 check_local_env();
+
+sub get_script_version {
+  my $version="";
+  my $file_handle;
+  my $line;
+  if (open($file_handle,"<",$0)) {
+    while ($line=<$file_handle>) {
+      if ($line=~/^#\s*Version:\s*(\S+)/) {
+        $version=$1;
+        last;
+      }
+    }
+    close($file_handle);
+  }
+  return("$version\n");
+}
 
 sub print_version {
   print "$script_version";
@@ -202,7 +330,6 @@ if (($option{'l'})||($option{'a'})||($option{'p'})) {
   if ($option{'c'}) {
     import_rhel_csv($rhel_csv);
     dump_rhel_data();
-    exit;
   }
   else {
     historical_rhel_data();
@@ -216,9 +343,8 @@ if (($option{'l'})||($option{'a'})||($option{'p'})) {
 
 if (($option{'w'})||($option{'a'})||($option{'p'})) {
   if ($option{'c'}) {
-    import_wsus_csv($wsus_csv);
+    import_wsus_data();
     dump_wsus_data();
-    exit;
   }
   else {
     historical_wsus_data();
@@ -234,7 +360,6 @@ if (($option{'s'})||($option{'a'})||($option{'p'})) {
   if ($option{'c'}) {
     import_pca_data($pca_html);
     dump_pca_data();
-    exit;
   }
   else {
     historical_pca_data();
@@ -242,12 +367,21 @@ if (($option{'s'})||($option{'a'})||($option{'p'})) {
   }
 }
 
+# If given -c only dump the data, don't generate anything
+
+if ($option{'c'}) {
+  exit;
+}
+
 #
 # If given any of the following options generate a spreadsheet
 #
 
 if (($option{'a'})||($option{'l'})||($option{'s'})||($option{'w'})||($option{'p'})) {
-  merge_cpr_data();
+  # Consolidated files are only regenerated (see clean_up_files) for -a and -p
+  if (($option{'a'})||($option{'p'})) {
+    merge_cpr_data();
+  }
   generate_speadsheet();
 }
 
@@ -258,20 +392,52 @@ if (($option{'a'})||($option{'l'})||($option{'s'})||($option{'w'})||($option{'p'
 
 sub clean_up_files {
   my $file_name;
-  my @file_list;
-  @file_list=`find $cpr_dir -name "*xpr*" -type f`;
-  foreach $file_name (@file_list) {
-    chomp($file_name);
-    if (-e "$file_name") {
-      if ($option{'v'}) {
-        print "Deleting $file_name\n";
-      }
-      system("rm $file_name");
+  foreach $file_name (find_files($cpr_dir,qr/xpr/)) {
+    if ($option{'v'}) {
+      print "Deleting $file_name\n";
     }
+    unlink($file_name) or warn "Could not delete $file_name: $!\n";
   }
   if (-e "$cpr_dir/pci_all") {
-    system("rm $cpr_dir/pci_all")
+    unlink("$cpr_dir/pci_all") or warn "Could not delete $cpr_dir/pci_all: $!\n";
   }
+}
+
+#
+# Get a sorted list of the files in a directory with names matching a pattern
+#
+
+sub find_files {
+  my $dir_name=$_[0];
+  my $pattern=$_[1];
+  my $dir_handle;
+  my @file_list;
+  if (opendir($dir_handle,$dir_name)) {
+    @file_list=sort map { "$dir_name/$_" } grep { (-f "$dir_name/$_")&&($_=~$pattern) } readdir($dir_handle);
+    closedir($dir_handle);
+  }
+  return(@file_list);
+}
+
+#
+# Check whether a host is in the PCI hosts list
+# Hosts are matched exactly, not as substrings
+#
+
+sub is_pci_host {
+  my $host_name=lc($_[0]);
+  return(scalar(grep { $_ eq $host_name } @pci_hosts));
+}
+
+#
+# Find the exclude list entry (hostname,reason) for a host
+# Returns an empty string if the host is not excluded
+#
+
+sub get_exclusion {
+  my $host_name=$_[0];
+  my ($entry)=grep { /^\Q$host_name\E\s*,/i } @exc_hosts;
+  return($entry||"");
 }
 
 #
@@ -282,10 +448,9 @@ sub clean_up_files {
 sub check_local_env {
   my @dir_list=( $raw_dir, $old_dir, $cpr_dir, $pci_dir, $xls_dir, $exc_dir );
   my $dir_name;
-  my $command;
   foreach $dir_name (@dir_list) {
-    if (! -e "$dir_name") {
-      system("mkdir $dir_name");
+    if (! -d "$dir_name") {
+      mkdir($dir_name) or die "Could not create directory $dir_name: $!\n";
     }
   }
   if (-e "$exc_hosts_file") {
@@ -293,14 +458,26 @@ sub check_local_env {
       print "Importing Excluded hosts\n";
     }
     import_file($exc_hosts_file);
-    @exc_hosts=@file_data;
+    @exc_hosts=();
+    foreach my $exc_host (@file_data) {
+      $exc_host=~s/^\s+|\s+$//g;
+      if ($exc_host=~/[A-Za-z0-9]/) {
+        push(@exc_hosts,$exc_host);
+      }
+    }
   }
   if (-e "$pci_hosts_file") {
     if ($option{'v'}) {
       print "Importing PCI hosts\n";
     }
     import_file($pci_hosts_file);
-    @pci_hosts=@file_data;
+    @pci_hosts=();
+    foreach my $pci_host (@file_data) {
+      $pci_host=~s/^\s+|\s+$//g;
+      if ($pci_host=~/[A-Za-z0-9]/) {
+        push(@pci_hosts,lc($pci_host));
+      }
+    }
   }
   if (-e "$master_file") {
     if ($option{'v'}) {
@@ -314,8 +491,7 @@ sub check_local_env {
     }
     import_cmdb_list();
   }
-  $run_date=`date "+%d/%m/%Y"`;
-  chomp($run_date);
+  $run_date=strftime("%d/%m/%Y",localtime());
   return;
 }
 
@@ -325,41 +501,37 @@ sub check_local_env {
 #
 
 sub create_speadsheet {
-  my $command;
+  my $pattern;
   if ($option{'a'}) {
-    $command="find $cpr_dir -type f";
+    $pattern=qr/./;
     if ($option{'S'}) {
       $xlsx_file="$xls_dir/summary_report.xlsx";
     }
     else {
       $xlsx_file="$xls_dir/all_report.xlsx";
     }
-    $workbook=Excel::Writer::XLSX->new($xlsx_file);
   }
   if ($option{'l'}) {
-    $command="find $cpr_dir -name '*lin*' -type f";
+    $pattern=qr/lin/;
     $xlsx_file="$xls_dir/linux_report.xlsx";
-    $workbook=Excel::Writer::XLSX->new($xlsx_file);
   }
   if ($option{'w'}) {
-    $command="find $cpr_dir -name '*win*' -type f";
+    $pattern=qr/win/;
     $xlsx_file="$xls_dir/windows_report.xlsx";
-    $workbook=Excel::Writer::XLSX->new($xlsx_file);
   }
   if ($option{'s'}) {
-    $command="find $cpr_dir -name '*sol*' -type f";
+    $pattern=qr/sol/;
     $xlsx_file="$xls_dir/solaris_report.xlsx";
-    $workbook=Excel::Writer::XLSX->new($xlsx_file);
   }
   if ($option{'p'}) {
-    $command="find $cpr_dir -name '*pci*' -type f";
+    $pattern=qr/pci/;
     $xlsx_file="$xls_dir/pci_report.xlsx";
-    $workbook=Excel::Writer::XLSX->new($xlsx_file);
   }
+  $workbook=Excel::Writer::XLSX->new($xlsx_file);
   if (!$option{'v'}) {
     print "Generating $xlsx_file\n";
   }
-  return($command);
+  return($pattern);
 }
 
 #
@@ -372,16 +544,15 @@ sub print_usage {
   print "\n";
   print "-h: Display help/usage\n";
   print "-V: Display version\n";
-  print "-r: Process Redhat Satellite patching information\n";
+  print "-l: Process Linux Red Hat Satellite patching information\n";
   print "-s: Process Solaris PCA patching information\n";
   print "-w: Process Windows WSUS patching information\n";
+  print "-p: Process PCI host patching information\n";
   print "-a: Proccess all patching information\n";
   print "-c: Output current data without processing (debug)\n";
   print "-i: Input raw data from file (used with -s, -l, or -w)\n";
   print "-S: Print summarised report (Cover sheet and All Platforms)\n";
   print "-L: Set low watermark\n";
-  print "-M: Set medium watermark\n";
-  print "-H: Set high watermark\n";
   print "-P: Set percentage watermark\n";
   print "-t: Do a traditional percentage based report\n";
   print "-v: Verbose output\n";
@@ -402,10 +573,10 @@ sub import_cmdb_list {
   my $host_name;
   my @data;
   my $line;
-  my @data;
   my $lc_line;
   my $junk;
   my $os_name;
+  my $os_source;
   my $env_name;
   my $server_info;
   my $description;
@@ -419,8 +590,9 @@ sub import_cmdb_list {
       $line="";
       foreach my $col ($sheet->{MinCol}..$sheet->{MaxCol}) {
         my $cell=$sheet->{Cells}[$row][$col];
-        $cell=$cell->{Val};
+        $cell=($cell&&defined($cell->{Val}))?$cell->{Val}:"";
         $cell=~s/\n/ /g;
+        $cell=~s/,/ /g;
         push(@data,$cell);
       }
       $line=join(",",@data);
@@ -434,8 +606,11 @@ sub import_cmdb_list {
     $lc_line=lc($line);
     if ($lc_line!~/decom|non-operational/) {
       $env_name="";
+      $os_name="";
       if ($lc_line=~/windows|linux|solaris/) {
-        if ($lc_line=~/prod/) {
+        # Prefer the Operating System column over the rest of the row
+        $os_source=(defined($data[9])&&lc($data[9])=~/windows|linux|solaris/)?lc($data[9]):$lc_line;
+        if ($lc_line=~/(?<!non-)(?<!non )prod/) {
           $env_name="Prod";
         }
         if ($lc_line=~/dev/) {
@@ -444,13 +619,13 @@ sub import_cmdb_list {
         if ($lc_line=~/test/) {
           $env_name="Test";
         }
-        if ($lc_line=~/windows/) {
+        if ($os_source=~/windows/) {
           $os_name="Windows";
         }
-        if ($lc_line=~/linux/) {
+        if ($os_source=~/linux/) {
           $os_name="Linux";
         }
-        if ($lc_line=~/solaris/) {
+        if ($os_source=~/solaris/) {
           $os_name="Solaris";
         }
         @data=split(/,/,$line);
@@ -479,6 +654,22 @@ sub import_cmdb_list {
 }
 
 #
+# Parse a date string from a report
+# Returns a Time::Piece object, or undef if the string is not a valid date
+#
+
+sub parse_report_date {
+  my $date_string=$_[0];
+  my $format=$_[1];
+  $date_string=~s/^\s+|\s+$//g;
+  if ($date_string eq "") {
+    return;
+  }
+  my $date=eval { Time::Piece->strptime($date_string,$format) };
+  return($date);
+}
+
+#
 # Generate a file suffix
 # Used for archiving files
 #
@@ -494,108 +685,61 @@ sub generate_file_suffix {
 }
 
 #
+# Get the value of a spreadsheet cell
+# Empty cells are returned as undef by Spreadsheet::ParseExcel
+#
+
+sub cell_value {
+  my $cell=$_[0];
+  if (!$cell) {
+    return("");
+  }
+  return($cell->value());
+}
+
+#
 # Load Server Master List into an array if it exists
 # Used to get more information about servers
 #
 
 sub import_master_list {
   my $host_name;
-  my $cell;
   my $row;
   my $row_min;
   my $row_max;
-  my $type;
   my $landscape;
   my $application;
-  my $location;
-  my $admin;
-  my $hardware;
-  my $sheet_no;
   my $server_info;
-  my $parser=Spreadsheet::ParseExcel->new();
-  my $input_workbook;
+  my $sheet;
   my $input_worksheet;
-  $input_workbook=$parser->Parse($master_file);
-  # Get Solaris host information
-  $sheet_no=0;
-  $input_worksheet=$input_workbook->worksheet($sheet_no);
-  ($row_min,$row_max)=$input_worksheet->row_range();
-  for $row ($row_min .. $row_max) {
-    $cell=$input_worksheet->get_cell($row,0);
-    $host_name=$cell->value();
-    $host_name=~s/\s+//g;
-    if ($host_name=~/[a-z]/) {
-      $cell=$input_worksheet->get_cell($row,1);
-      $type=$cell->value();
-      $type=~s/\s+//g;
-      $cell=$input_worksheet->get_cell($row,2);
-      $hardware=$cell->value();
-      $hardware=~s/\s+//g;
-      $cell=$input_worksheet->get_cell($row,3);
-      $location=$cell->value();
-      $location=~s/^\s+//g;
-      $location=~s/ $//g;
-      $cell=$input_worksheet->get_cell($row,4);
-      $landscape=$cell->value();
-      $landscape=~s/\s+//g;
-      $cell=$input_worksheet->get_cell($row,5);
-      $admin=$cell->value();
-      $admin=~s/^\s+//g;
-      $admin=~s/ $//g;
-      $cell=$input_worksheet->get_cell($row,ord('U')-65);
-      $application=$cell->value();
-      $application=~s/\n/ /g;
-      $application=~s/^\s+//g;
-      $application=~s/ $//g;
-      if ($type=~/^p$|^P$/) {
-        $type="Physical";
-      }
-      if ($type=~/^v$|^V$/) {
-        $type="Virtual";
-      }
-      $server_info="$host_name,$landscape,$application";
-      push(@master_list,$server_info);
-    }
+  my $parser=Spreadsheet::ParseExcel->new();
+  my $input_workbook=$parser->Parse($master_file);
+  if (!$input_workbook) {
+    warn "Could not parse $master_file: ".$parser->error()."\n";
+    return;
   }
-  # Process Linux Information
-  $sheet_no=0;
-  $input_worksheet=$input_workbook->worksheet($sheet_no);
-  ($row_min,$row_max)=$input_worksheet->row_range();
-  for $row ($row_min .. $row_max) {
-    $cell=$input_worksheet->get_cell($row,0);
-    $host_name=$cell->value();
-    $host_name=~s/\s+//g;
-    if ($host_name=~/[a-z]/) {
-      $cell=$input_worksheet->get_cell($row,1);
-      $type=$cell->value();
-      $type=~s/\s+//g;
-      $cell=$input_worksheet->get_cell($row,2);
-      $hardware=$cell->value();
-      $hardware=~s/\s+//g;
-      $cell=$input_worksheet->get_cell($row,3);
-      $location=$cell->value();
-      $location=~s/^\s+//g;
-      $location=~s/ $//g;
-      $cell=$input_worksheet->get_cell($row,4);
-      $landscape=$cell->value();
-      $landscape=~s/\s+//g;
-      $cell=$input_worksheet->get_cell($row,5);
-      $admin=$cell->value();
-      $admin=~s/^\s+//g;
-      $admin=~s/ $//g;
-      $cell=$input_worksheet->get_cell($row,ord('Y')-65);
-      $application=$cell->value();
-      $application=~s/\n/ /g;
-      $application=~s/^\s+//g;
-      $application=~s/ $//g;
-      if ($type=~/^p$|^P$/) {
-        $type="Physical";
+  # Worksheet number and the application column for each platform
+  # Sheet 0 has the Solaris hosts, sheet 1 has the Linux hosts
+  my @sheets=( [ 0, ord('U')-65 ], [ 1, ord('Y')-65 ] );
+  foreach $sheet (@sheets) {
+    $input_worksheet=$input_workbook->worksheet($sheet->[0]);
+    if (!$input_worksheet) {
+      next;
+    }
+    ($row_min,$row_max)=$input_worksheet->row_range();
+    for $row ($row_min .. $row_max) {
+      $host_name=cell_value($input_worksheet->get_cell($row,0));
+      $host_name=~s/\s+//g;
+      if ($host_name=~/[a-z]/) {
+        $landscape=cell_value($input_worksheet->get_cell($row,4));
+        $landscape=~s/\s+//g;
+        $application=cell_value($input_worksheet->get_cell($row,$sheet->[1]));
+        $application=~s/\n/ /g;
+        $application=~s/^\s+//g;
+        $application=~s/ $//g;
+        $server_info="$host_name,$landscape,$application";
+        push(@master_list,$server_info);
       }
-      if ($type=~/^v$|^V$/) {
-        $type="Virtual";
-      }
-      $server_info="$host_name,$landscape,$application";
-      push(@master_list,$server_info);
     }
   }
   return;
@@ -608,48 +752,137 @@ sub import_master_list {
 
 sub get_environment {
   my $host_name=$_[0];
-  my $env_name;
+  my $env_name="";
   my $server_info;
   my $lc_server_info;
+  my $match;
+  # Use the Server Master List first (last matching entry wins)
   foreach $server_info (@master_list) {
-    if ($server_info=~/^$host_name,/) {
-      switch($server_info) {
-        case /PROD/                           { $env_name="Prod" }
-        case /TEST/                           { $env_name="Test" }
-        case /DEV/                            { $env_name="Dev" }
+    if ($server_info=~/^\Q$host_name\E,/) {
+      $match=first_match($server_info,@master_env_rules);
+      if (defined($match)) {
+        $env_name=$match;
       }
     }
   }
-  if ($env_name!~/[A-z]/) {
-    switch($host_name) {
-      case /prod|p[0-9]|o[0-9]|cd[0-9]|wp/    { $env_name="Prod" }
-      case /ora[0-9]|apps[0-9]|appdb[0-9]/    { $env_name="Prod" }
-      case /fin[0-9]|mon[0-9]|ninja|dp[0-9]/  { $env_name="Prod" }
-      case /cvs[0-9]|tax[0-9]/                { $env_name="Prod" }
-      case /dev|da[0-9]|do[0-9]|dd[0-9]/      { $env_name="Dev" }
-      case /lab[0-9]|pd[0-9]/                 { $env_name="Dev" }
-      case /test|ta[0-9]|to[0-9]|wu/          { $env_name="Test" }
+  # Otherwise try and work it out from the host name
+  if ($env_name eq "") {
+    $match=first_match($host_name,@host_env_rules);
+    if (defined($match)) {
+      $env_name=$match;
     }
   }
-  if ($env_name!~/[A-z]/) {
+  # Otherwise use the CMDB information
+  if ($env_name eq "") {
     foreach $server_info (@cmdb_list) {
       $lc_server_info=lc($server_info);
-      if ($lc_server_info=~/^$host_name,/) {
-        switch($lc_server_info) {
-          case /dr|prod/                      { $env_name="Prod" }
-          case /dev/                          { $env_name="Dev" }
-          case /test/                         { $env_name="Dev" }
+      if ($lc_server_info=~/^\Q$host_name\E,/) {
+        $match=first_match($lc_server_info,@cmdb_env_rules);
+        if (defined($match)) {
+          $env_name=$match;
         }
       }
     }
   }
-  if ($env_name!~/[A-z]/) {
+  if ($env_name eq "") {
     $env_name="Unknown";
   }
   if ($option{'v'}) {
     print "Setting environment for $host_name to $env_name\n";
   }
   return($env_name);
+}
+
+#
+# Return the value of the first rule whose pattern matches the string
+# Rules are [ pattern, value ] pairs, returns undef if none match
+#
+
+sub first_match {
+  my $string=shift;
+  my $rule;
+  foreach $rule (@_) {
+    if ($string=~$rule->[0]) {
+      return($rule->[1]);
+    }
+  }
+  return;
+}
+
+#
+# Get the date of a Red Hat Satellite report
+# The report has no date, so use the first check in date that appears on
+# consecutive lines, as most hosts check in at the same time
+#
+
+sub get_rhel_report_date {
+  my $file_name=$_[0];
+  my $file_handle;
+  my $line;
+  my @fields;
+  my $date="";
+  my $last_date="";
+  if (open($file_handle,"<",$file_name)) {
+    while ($line=<$file_handle>) {
+      chomp($line);
+      @fields=split(/,/,$line,-1);
+      if ((defined($fields[6]))&&($fields[6]=~/[0-9]/)) {
+        ($date)=split(" ",$fields[6]);
+        if ((defined($date))&&($date eq $last_date)) {
+          close($file_handle);
+          return($date);
+        }
+        $last_date=(defined($date))?$date:"";
+      }
+    }
+    close($file_handle);
+  }
+  return("");
+}
+
+#
+# Get the date of a Solaris PCA report
+# This is fields 8 to 10 of the line containing the time zone
+#
+
+sub get_pca_report_date {
+  my $file_name=$_[0];
+  my $file_handle;
+  my $line;
+  my @fields;
+  if (open($file_handle,"<",$file_name)) {
+    while ($line=<$file_handle>) {
+      if ($line=~/EST/) {
+        @fields=split(" ",$line);
+        close($file_handle);
+        return(join(" ",grep { defined($_) } @fields[7..9]));
+      }
+    }
+    close($file_handle);
+  }
+  return("");
+}
+
+#
+# Get the date of a Windows WSUS report
+# This is the first field of the last line that contains a number
+#
+
+sub get_wsus_report_date {
+  my $file_name=$_[0];
+  my $file_handle;
+  my $line;
+  my $last_line="";
+  if (open($file_handle,"<",$file_name)) {
+    while ($line=<$file_handle>) {
+      if ($line=~/[0-9]/) {
+        $last_line=$line;
+      }
+    }
+    close($file_handle);
+  }
+  my ($date)=split(/,/,$last_line);
+  return(defined($date)?$date:"");
 }
 
 #
@@ -675,27 +908,32 @@ sub historical_rhel_data {
   my $cmdb_env;
   my $rhel_test;
   my $description;
+  my $output;
+  my $pci_output;
   if (-e "$rhel_csv") {
     # Get date by looking for common check in time
-    $date_string=`cat $rhel_csv |cut -f7 -d, |grep '[0-9]' |awk '{print \$1}' |uniq -d |head -1`;
-    chomp($date_string);
-    $date_string=Time::Piece->strptime($date_string,"%m/%d/%y");
+    $date_string=get_rhel_report_date($rhel_csv);
+    $date_string=parse_report_date($date_string,"%m/%d/%y");
+    if (!$date_string) {
+      print "Unable to determine report date from $rhel_csv\n";
+      return;
+    }
     $date_string=$date_string->dmy;
     $date_string=generate_file_suffix($date_string);
-    $date_file="$rhel_csv"."_"."$date_string";
+    $date_file="$old_dir/".basename($rhel_csv)."_"."$date_string";
     # Make a dated copy of the raw data
     if (!-e "$date_file") {
       if ($option{'v'}) {
         print "Archiving $rhel_csv to $date_file\n";
       }
-      system("cp $rhel_csv $date_file");
+      copy($rhel_csv,$date_file) or warn "Could not archive $rhel_csv to $date_file: $!\n";
     }
     # Process raw date into a standard dated file
     $date_file="$cpr_dir/lin_$date_string";
     $pci_file="$cpr_dir/pci_$date_string";
     if (! -e "$date_file") {
-      open(OUTPUT,">",$date_file);
-      open(PCIOUT,">>",$pci_file);
+      open($output,">",$date_file) or die "Could not open $date_file: $!\n";
+      open($pci_output,">>",$pci_file) or die "Could not open $pci_file: $!\n";
       import_rhel_csv();
       foreach $cmdb_line (@cmdb_list) {
         if ($cmdb_line=~/Linux/) {
@@ -715,7 +953,7 @@ sub historical_rhel_data {
                 ($host_name)=split /\./, $host_name;
               }
               $host_name=lc($host_name);
-              if ($host_name=~/$cmdb_host/) {
+              if ($host_name eq $cmdb_host) {
                 $rhel_test=1;
                 # get the number of critical patches outstanding
                 $critical=$data[2];
@@ -725,14 +963,14 @@ sub historical_rhel_data {
                 $date=$data[0];
                 $date=Time::Piece->strptime($date,"%m/%d/%y");
                 $date=$date->dmy("/");
-                if (grep /$host_name/, @pci_hosts) {
+                if (is_pci_host($host_name)) {
                   $env_name="PCI";
-                  print PCIOUT "$host_name,$platform,$env_name,$critical,,$date\n";
+                  print {$pci_output} "$host_name,$platform,$env_name,$critical,,$date\n";
                 }
-                if ($env_name!~/[A-z]/) {
+                if ($env_name!~/[A-Za-z]/) {
                   $env_name=get_environment($host_name);
                 }
-                print OUTPUT "$host_name,$platform,$env_name,$critical,,$date\n";
+                print {$output} "$host_name,$platform,$env_name,$critical,,$date\n";
               }
             }
           }
@@ -740,20 +978,20 @@ sub historical_rhel_data {
             $env_name="";
             $critical="N/A";
             $date="None";
-            if (grep /$cmdb_host/, @pci_hosts) {
+            if (is_pci_host($cmdb_host)) {
               $env_name="PCI";
-              print PCIOUT "$cmdb_host,$platform,$env_name,$critical,,$run_date\n";
+              print {$pci_output} "$cmdb_host,$platform,$env_name,$critical,,$run_date\n";
             }
-            if ($env_name!~/[A-z]/) {
+            if ($env_name!~/[A-Za-z]/) {
               $env_name=get_environment($cmdb_host);
             }
-            print OUTPUT "$cmdb_host,$platform,$env_name,$critical,,$run_date\n";
+            print {$output} "$cmdb_host,$platform,$env_name,$critical,,$run_date\n";
           }
         }
       }
+      close($output);
+      close($pci_output);
     }
-    close(OUTPUT);
-    close(PCIOUT);
   }
   return;
 }
@@ -782,26 +1020,31 @@ sub historical_pca_data {
   my $pca_test;
   my $description;
   my $host_id;
+  my $output;
+  my $pci_output;
   if (-e "$pca_html") {
-    $date_string=`cat $pca_html |grep EST |awk '{print \$8" "\$9" "\$10}'`;
-    chomp($date_string);
-    $date_string=Time::Piece->strptime($date_string,"%d %B %Y");
+    $date_string=get_pca_report_date($pca_html);
+    $date_string=parse_report_date($date_string,"%d %B %Y");
+    if (!$date_string) {
+      print "Unable to determine report date from $pca_html\n";
+      return;
+    }
     $date_string=$date_string->dmy;
     $date_string=generate_file_suffix($date_string);
-    $date_file="$pca_html"."_"."$date_string";
+    $date_file="$old_dir/".basename($pca_html)."_"."$date_string";
     # Make a dated copy of the raw data
     if (!-e "$date_file") {
       if ($option{'v'}) {
         print "Archiving $pca_html to $date_file\n";
       }
-      system("cp $pca_html $date_file");
+      copy($pca_html,$date_file) or warn "Could not archive $pca_html to $date_file: $!\n";
     }
     # Process raw date into a standard dated file
     $date_file="$cpr_dir/sol_$date_string";
     $pci_file="$cpr_dir/pci_$date_string";
     if (!-e "$date_file") {
-      open(OUTPUT,">",$date_file);
-      open(PCIOUT,">>",$pci_file);
+      open($output,">",$date_file) or die "Could not open $date_file: $!\n";
+      open($pci_output,">>",$pci_file) or die "Could not open $pci_file: $!\n";
       import_pca_data();
       foreach $cmdb_line (@cmdb_list) {
         if ($cmdb_line=~/Solaris/) {
@@ -824,39 +1067,40 @@ sub historical_pca_data {
               ($host_name)=split /\./, $host_name;
             }
             $host_name=lc($host_name);
-            if ($host_name=~/$cmdb_host/) {
+            if ($host_name eq $cmdb_host) {
               $pca_test=1;
               # Fix date
               @data=split(/\./,$date);
               $date="$data[2]/$data[1]/$data[0]";
-              if (grep /$host_name/, @pci_hosts) {
+              if (is_pci_host($host_name)) {
                 $env_name="PCI";
-                print PCIOUT "$host_name,$platform,$env_name,$critical,$host_id,$date\n";
+                print {$pci_output} "$host_name,$platform,$env_name,$critical,$host_id,$date\n";
               }
-              if ($env_name!~/[A-z]/) {
+              if ($env_name!~/[A-Za-z]/) {
                 $env_name=get_environment($host_name);
               }
-              print OUTPUT "$host_name,$platform,$env_name,$critical,$host_id,$date\n";
+              print {$output} "$host_name,$platform,$env_name,$critical,$host_id,$date\n";
             }
           }
           if ($pca_test == 0) {
             $env_name="";
             $critical="N/A";
             $date="None";
-            if (grep /$cmdb_host/, @pci_hosts) {
+            $host_id="";
+            if (is_pci_host($cmdb_host)) {
               $env_name="PCI";
-              print PCIOUT "$cmdb_host,$platform,$env_name,$critical,$host_id,$run_date\n";
+              print {$pci_output} "$cmdb_host,$platform,$env_name,$critical,$host_id,$run_date\n";
             }
-            if ($env_name!~/[A-z]/) {
+            if ($env_name!~/[A-Za-z]/) {
               $env_name=get_environment($cmdb_host);
             }
-            print OUTPUT "$cmdb_host,$platform,$env_name,$critical,$host_id,$run_date\n";
+            print {$output} "$cmdb_host,$platform,$env_name,$critical,$host_id,$run_date\n";
           }
         }
       }
+      close($output);
+      close($pci_output);
     }
-    close(OUTPUT);
-    close(PCIOUT);
   }
   return;
 }
@@ -885,44 +1129,42 @@ sub historical_wsus_data {
   my $wsus_test;
   my $description;
   my $patch_info;
-  my $fields;
-  my $file_handle;
   my $csv=Text::CSV->new({quote_char => '"'});
+  my $output;
+  my $pci_output;
   if (-e "$wsus_csv") {
-    $date_string=`cat $wsus_csv |tail -1 |cut -f1 -d,`;
-    chomp($date_string);
-    $date_string=Time::Piece->strptime($date_string,"%d/%m/%Y");
+    $date_string=get_wsus_report_date($wsus_csv);
+    $date_string=parse_report_date($date_string,"%d/%m/%Y");
+    if (!$date_string) {
+      print "Unable to determine report date from $wsus_csv\n";
+      return;
+    }
     $date_string=$date_string->dmy;
     $date_string=generate_file_suffix($date_string);
-    $date_file="$wsus_csv"."_"."$date_string";
+    $date_file="$old_dir/".basename($wsus_csv)."_"."$date_string";
     # Make a dated copy of the raw data
     if (!-e "$date_file") {
       if ($option{'v'}) {
         print "Archiving $wsus_csv to $date_file\n";
       }
-      system("cp $wsus_csv $date_file");
+      copy($wsus_csv,$date_file) or warn "Could not archive $wsus_csv to $date_file: $!\n";
     }
     # Process raw date into a standard dated file
     $date_file="$cpr_dir/win_$date_string";
     $pci_file="$cpr_dir/pci_$date_string";
     if (!-e "$date_file") {
-      open(OUTPUT,">",$date_file);
-      open(PCIOUT,">>",$pci_file);
+      open($output,">",$date_file) or die "Could not open $date_file: $!\n";
+      open($pci_output,">>",$pci_file) or die "Could not open $pci_file: $!\n";
       import_wsus_data();
-      open ($file_handle,"<",$wsus_csv);
       foreach $cmdb_line (@cmdb_list) {
         if ($cmdb_line=~/Windows/) {
           $wsus_test=0;
           ($cmdb_host,$cmdb_os,$cmdb_env,$description)=split(/,/,$cmdb_line);
-          #while ($line=getline($file_handle)) {
           foreach $line (@wsus_data) {
             $env_name="";
             if ($line!~/Client/) {
               #  "Hostname", "Platform", "Missing", "Date", "PCI"
-              #chomp($line);
-              #$fields=$csv->getline($line);
               # get the number of critical patches outstanding
-              #@data=split(",",$line);
               $csv->parse($line);
               @data=$csv->fields();
               $date=$data[0];
@@ -937,16 +1179,16 @@ sub historical_wsus_data {
                 ($host_name)=split /\./, $host_name;
               }
               $host_name=lc($host_name);
-              if ($host_name=~/$cmdb_host/) {
+              if ($host_name eq $cmdb_host) {
                 $wsus_test=1;
-                if (grep /$host_name/, @pci_hosts) {
+                if (is_pci_host($host_name)) {
                   $env_name="PCI";
-                  print PCIOUT "$host_name,$platform,$env_name,$critical,$patch_info,$date\n";
+                  print {$pci_output} "$host_name,$platform,$env_name,$critical,$patch_info,$date\n";
                 }
-                if ($env_name!~/[A-z]/) {
+                if ($env_name!~/[A-Za-z]/) {
                   $env_name=get_environment($host_name);
                 }
-                print OUTPUT "$host_name,$platform,$env_name,$critical,$patch_info,$date\n";
+                print {$output} "$host_name,$platform,$env_name,$critical,$patch_info,$date\n";
               }
             }
           }
@@ -954,20 +1196,21 @@ sub historical_wsus_data {
             $env_name="";
             $critical="N/A";
             $date="None";
-            if (grep /$cmdb_host/, @pci_hosts) {
+            $patch_info="";
+            if (is_pci_host($cmdb_host)) {
               $env_name="PCI";
-              print PCIOUT "$cmdb_host,$platform,$env_name,$critical,$patch_info,$run_date\n";
+              print {$pci_output} "$cmdb_host,$platform,$env_name,$critical,$patch_info,$run_date\n";
             }
-            if ($env_name!~/[A-z]/) {
+            if ($env_name!~/[A-Za-z]/) {
               $env_name=get_environment($cmdb_host);
             }
-            print OUTPUT "$cmdb_host,$platform,$env_name,$critical,$patch_info,$run_date\n";
+            print {$output} "$cmdb_host,$platform,$env_name,$critical,$patch_info,$run_date\n";
           }
         }
       }
+      close($output);
+      close($pci_output);
     }
-    close(OUTPUT);
-    close(PCIOUT);
   }
   return;
 }
@@ -982,11 +1225,25 @@ sub import_file {
   my $file_handle;
   @file_data=();
   if (-e "$file_name") {
-    @file_data=do {
-      open my $file_handle, "<", $file_name or die "could not open $file_name: $!";
-      <$file_handle>;
-    };
+    open($file_handle,"<",$file_name) or die "Could not open $file_name: $!\n";
+    @file_data=<$file_handle>;
+    close($file_handle);
   }
+  return;
+}
+
+#
+# Write lines to a file
+# The mode is ">" to overwrite the file or ">>" to append to it
+#
+
+sub write_lines {
+  my $file_name=shift;
+  my $mode=shift;
+  my $file_handle;
+  open($file_handle,$mode,$file_name) or die "Could not open $file_name: $!\n";
+  print {$file_handle} @_;
+  close($file_handle) or die "Could not write $file_name: $!\n";
   return;
 }
 
@@ -1043,30 +1300,21 @@ sub merge_rhel_data {
   my $file_name;
   my @file_list;
   my $output_file;
-  my $line;
   # Get list of Linux historical files and build into a single array
   @all_rhel_data=();
-  @file_list=`find $cpr_dir -name "lin*" |grep '[0-9]'`;
+  @file_list=find_files($cpr_dir,qr/^lin.*[0-9]/);
   foreach $file_name (@file_list) {
-    chomp($file_name);
     import_file($file_name);
     @all_rhel_data=(@all_rhel_data,@file_data);
     if (($option{'a'})||($option{'p'})) {
       $output_file=$file_name;
       $output_file=~s/lin/xpr/g;
-      open(OUTPUT,">>",$output_file);
-      foreach $line (@file_data) {
-        print OUTPUT "$line";
-      }
-      close(OUTPUT);
+      write_lines($output_file,">>",@file_data);
     }
   }
   # Create a file with all the Linux historical data
   $output_file="$cpr_dir/lin_all";
-  open(OUTPUT,">",$output_file);
-  foreach $line (@all_rhel_data) {
-    print OUTPUT "$line";
-  }
+  write_lines($output_file,">",@all_rhel_data);
   return;
 }
 
@@ -1079,31 +1327,21 @@ sub merge_wsus_data {
   my $file_name;
   my @file_list;
   my $output_file;
-  my $line;
   # Get a list of Windows historical files and build into a single array
   @all_wsus_data=();
-  @file_list=`find $cpr_dir -name "win*" |grep '[0-9]'`;
+  @file_list=find_files($cpr_dir,qr/^win.*[0-9]/);
   foreach $file_name (@file_list) {
-    chomp($file_name);
     import_file($file_name);
     @all_wsus_data=(@all_wsus_data,@file_data);
     if (($option{'a'})||($option{'p'})) {
       $output_file=$file_name;
       $output_file=~s/win/xpr/g;
-      open(OUTPUT,">>",$output_file);
-      foreach $line (@file_data) {
-        print OUTPUT "$line";
-      }
-      close(OUTPUT);
+      write_lines($output_file,">>",@file_data);
     }
   }
   # Create a file with all the Linux historical data
   $output_file="$cpr_dir/win_all";
-  open(OUTPUT,">",$output_file);
-  foreach $line (@all_wsus_data) {
-    print OUTPUT "$line";
-  }
-  close(OUTPUT);
+  write_lines($output_file,">",@all_wsus_data);
   return;
 }
 
@@ -1116,30 +1354,21 @@ sub merge_pca_data {
   my $file_name;
   my @file_list;
   my $output_file;
-  my $line;
   # Get a list of Solaris historical files and build into a single array
   @all_pca_data=();
-  @file_list=`find $cpr_dir -name "sol*" |grep '[0-9]'`;
+  @file_list=find_files($cpr_dir,qr/^sol.*[0-9]/);
   foreach $file_name (@file_list) {
-    chomp($file_name);
     import_file($file_name);
     @all_pca_data=(@all_pca_data,@file_data);
     if (($option{'a'})||($option{'p'})) {
       $output_file=$file_name;
       $output_file=~s/sol/xpr/g;
-      open(OUTPUT,">>",$output_file);
-      foreach $line (@file_data) {
-        print OUTPUT "$line";
-      }
-      close(OUTPUT);
+      write_lines($output_file,">>",@file_data);
     }
   }
   # Create a file with all the Linux historical data
   $output_file="$cpr_dir/sol_all";
-  open(OUTPUT,">",$output_file);
-  foreach $line (@all_pca_data) {
-    print OUTPUT "$line";
-  }
+  write_lines($output_file,">",@all_pca_data);
   return;
 }
 
@@ -1158,29 +1387,26 @@ sub merge_cpr_data {
   my @data;
   # Get a list of all historical files and build into a single array
   @all_cpr_data=();
-  @file_list=`find $cpr_dir -name "*xpr*" |grep '[0-9]'`;
+  @file_list=find_files($cpr_dir,qr/xpr.*[0-9]|[0-9].*xpr/);
   foreach $file_name (@file_list) {
-    chomp($file_name);
     import_file($file_name);
     @all_cpr_data=(@all_cpr_data,@file_data);
   }
   # Create a file with all the Linux historical data
   $output_file="$cpr_dir/xpr_all";
   $pci_file="$cpr_dir/pci_all";
-  open(OUTPUT,">",$output_file);
-  open(PCIOUT,">",$pci_file);
-  foreach $line (@all_cpr_data) {
-    print OUTPUT "$line";
-    if (($option{'a'})||($option{'p'})) {
+  my @pci_data;
+  if (($option{'a'})||($option{'p'})) {
+    foreach $line (@all_cpr_data) {
       @data=split(/,/,$line);
       $host_name=$data[0];
-      if (grep /$host_name/, @pci_hosts) {
-        print PCIOUT "$line";
+      if (is_pci_host($host_name)) {
+        push(@pci_data,$line);
       }
     }
   }
-  close(OUTPUT);
-  close(PCIOUT);
+  write_lines($output_file,">",@all_cpr_data);
+  write_lines($pci_file,">",@pci_data);
 }
 
 #
@@ -1197,16 +1423,9 @@ sub generate_worksheet_name {
   my $prefix;
   my $junk;
   my $worksheet_name;
-  switch($file_name) {
-    case /xpr_/       { $prefix="All Platforms" }
-    case /win_all/    { $prefix="All Windows" }
-    case /lin_all/    { $prefix="All Linux" }
-    case /sol_all/    { $prefix="All Solaris" }
-    case /pci_all/    { $prefix="All PCI" }
-    case /win_[0-9]/  { $prefix="Windows" }
-    case /lin_[0-9]/  { $prefix="Linux" }
-    case /sol_[0-9]/  { $prefix="Solaris" }
-    case /pci_[0-9]/  { $prefix="PCI" }
+  $prefix=first_match($file_name,@worksheet_prefix_rules);
+  if (!defined($prefix)) {
+    $prefix="";
   }
   if ($file_name=~/[0-9]/) {
     $date_string=$file_name;
@@ -1220,7 +1439,48 @@ sub generate_worksheet_name {
   else {
     $worksheet_name="$prefix";
   }
-  return ($worksheet_name,$month);
+  return ($worksheet_name,$month,$year);
+}
+
+#
+# Sort order for report files
+# Monthly platform files come first (oldest first), then monthly consolidated
+# files, then the all-time files. The consolidated worksheets are built from
+# data collected while the platform worksheets are processed, so order matters.
+#
+
+sub report_file_order {
+  my ($file_a,$file_b)=@_;
+  my @keys;
+  foreach my $file_name ($file_a,$file_b) {
+    my $rank=2;
+    my $month=0;
+    my $year=0;
+    if ($file_name=~/_(\d\d)_(\d{4})\s*$/) {
+      $month=$1;
+      $year=$2;
+      $rank=($file_name=~/xpr_/)?1:0;
+    }
+    push(@keys,[$rank,$year,$month,$file_name]);
+  }
+  return($keys[0][0]<=>$keys[1][0] || $keys[0][1]<=>$keys[1][1] || $keys[0][2]<=>$keys[1][2] || $keys[0][3] cmp $keys[1][3]);
+}
+
+#
+# Get the list of months (e.g. "Oct 2013") that have data, oldest first
+#
+
+sub get_report_periods {
+  my %seen;
+  my @periods;
+  foreach my $line (@patch_info) {
+    my $period=(split(/,/,$line))[-1];
+    if ($period=~/^[A-Za-z]{3} \d{4}$/) {
+      $seen{$period}=1;
+    }
+  }
+  @periods=sort { Time::Piece->strptime($a,"%b %Y")->epoch <=> Time::Piece->strptime($b,"%b %Y")->epoch } keys(%seen);
+  return(@periods);
 }
 
 #
@@ -1241,7 +1501,9 @@ sub create_cover_sheet {
   # Create front page
   $worksheet=$workbook->add_worksheet('Introduction');
   $worksheet->set_column(0,1,24);
-  $worksheet->insert_image('A1',$logo_img,0,0,1.5,1.5);
+  if (-e "$logo_img") {
+    $worksheet->insert_image('A1',$logo_img,0,0,1.5,1.5);
+  }
   $format=$workbook->add_format(border => 0, bold => 1, size => 32);
   $worksheet->set_row(0,36);
   $worksheet->write(0,1,$title,$format);
@@ -1263,8 +1525,7 @@ sub create_cover_sheet {
     $cover_os="Windows, Solaris and Linux (PCI hosts)";
   }
   $worksheet->write(2,1,"Platforms: $cover_os",$format);
-  $date_info=`date`;
-  chomp($date_info);
+  $date_info=strftime("%a %b %e %H:%M:%S %Z %Y",localtime());
   $worksheet->set_row(4,24);
   $worksheet->write(4,1,$date_info,$format);
   return;
@@ -1403,7 +1664,7 @@ sub generate_os_monthly_totals {
     $patch_info=$data[5];
     $patch_date=$data[-1];
     if ($env_name=~/PCI/) {
-      if (($patch_env=~/PCI/)&&($patch_date=~/$date_string/)) {
+      if (($patch_env=~/PCI/)&&($patch_date eq $date_string)) {
         if ($patch_no!~/N\/A/) {
           $os_host_count++;
           $os_patch_total=$os_patch_total+$patch_no;
@@ -1414,7 +1675,7 @@ sub generate_os_monthly_totals {
       }
     }
     else {
-      if (($patch_os=~/$os_name/)&&($patch_date=~/$date_string/)) {
+      if (($patch_os=~/$os_name/)&&($patch_date eq $date_string)) {
         if ($patch_no!~/N\/A/) {
           $os_host_count++;
           $os_patch_total=$os_patch_total+$patch_no;
@@ -1428,7 +1689,6 @@ sub generate_os_monthly_totals {
   if ($os_host_count > 1) {
     $os_percent=$os_low_count/$os_host_count*100;
     $os_percent=sprintf("%1d",$os_percent);
-    $os_patch_total=$os_patch_total-1;
     $format=$workbook->add_format(bg_color => 'white', border => 2);
     $os_info="$os_name ($date_string)";
     $worksheet->write($key_row,$key_col,$os_info,$format);
@@ -1447,7 +1707,7 @@ sub generate_os_monthly_totals {
           $code="green";
         }
         else {
-          if ($os_percent < 90) {
+          if ($os_percent < $percent_wm) {
             $code="red";
           }
           else {
@@ -1537,9 +1797,9 @@ sub generate_env_monthly_totals {
     $patch_no=$data[3];
     $patch_check=$data[4];
     $patch_date=$data[-1];
-    if ($os_name=~/[A-z]/) {
+    if ($os_name=~/[A-Za-z]/) {
       if ($patch_os=~/$os_name/) {
-        if (($patch_env=~/$env_name/)&&($patch_date=~/$date_string/)) {
+        if (($patch_env=~/$env_name/)&&($patch_date eq $date_string)) {
           if ($env_name=~/Unknown/) {
             $env_host_count++;
           }
@@ -1563,7 +1823,7 @@ sub generate_env_monthly_totals {
       }
     }
     else {
-      if (($patch_env=~/$env_name/)&&($patch_date=~/$date_string/)) {
+      if (($patch_env=~/$env_name/)&&($patch_date eq $date_string)) {
         if ($env_name=~/Unknown/) {
           $env_host_count++;
         }
@@ -1589,7 +1849,6 @@ sub generate_env_monthly_totals {
   if ($env_host_count > 1) {
     $env_percent=$env_low_count/$env_host_count*100;
     $env_percent=sprintf("%1d",$env_percent);
-    $env_patch_total=$env_patch_total-1;
     $format=$workbook->add_format(bg_color => 'white', border => 2);
     $env_info="$env_name ($date_string)";
     $worksheet->write($key_row,$key_col,$env_info,$format);
@@ -1616,11 +1875,11 @@ sub generate_env_monthly_totals {
             $code="green";
           }
           else {
-            if ($env_percent < 90) {
+            if ($env_percent < $percent_wm) {
               $code="red";
             }
             else {
-              if ($env_percent = 100) {
+              if ($env_percent == 100) {
                 $code="green"
               }
               else {
@@ -1783,12 +2042,10 @@ sub generate_platform_totals {
   my $os_name=$_[3];
   my $worksheet_name=$_[4];
   my $section_name;
-  my $env_name;
+  my $env_name="";
   my $top_row;
   my $end_row;
   my $grid_ref;
-  my $counter;
-  my $month;
   my $month_counter=0;
   my $last_patch_total;
   # Insert Platform header
@@ -1810,9 +2067,7 @@ sub generate_platform_totals {
       else {
         foreach $os_name (@os_names) {
           $month_counter=0;
-          for ($counter=1;$counter<13;$counter++) {
-            $month=Time::Piece->strptime($counter,'%m');
-            $date_string=$month->monname;
+          foreach $date_string (get_report_periods()) {
             ($key_row,$key_col,$last_patch_total,$month_counter)=generate_os_monthly_totals($key_row,$key_col,$last_patch_total,$month_counter,$date_string,$os_name,$env_name);
           }
         }
@@ -1821,9 +2076,7 @@ sub generate_platform_totals {
     else {
       if ($worksheet_name=~/PCI/) {
         $month_counter=0;
-        for ($counter=1;$counter<13;$counter++) {
-          $month=Time::Piece->strptime($counter,'%m');
-          $date_string=$month->monname;
+        foreach $date_string (get_report_periods()) {
           ($key_row,$key_col,$last_patch_total,$month_counter)=generate_os_monthly_totals($key_row,$key_col,$last_patch_total,$month_counter,$date_string,$os_name,"PCI");
         }
       }
@@ -1831,9 +2084,7 @@ sub generate_platform_totals {
         foreach $os_name (@os_names) {
           if ($worksheet_name=~/$os_name/) {
             $month_counter=0;
-            for ($counter=1;$counter<13;$counter++) {
-              $month=Time::Piece->strptime($counter,'%m');
-              $date_string=$month->monname;
+            foreach $date_string (get_report_periods()) {
               ($key_row,$key_col,$last_patch_total,$month_counter)=generate_os_monthly_totals($key_row,$key_col,$last_patch_total,$month_counter,$date_string,$os_name,$env_name);
             }
           }
@@ -1869,12 +2120,10 @@ sub generate_env_totals {
   my $env_name=$_[3];
   my $worksheet_name=$_[4];
   my $section_name;
-  my $os_name;
+  my $os_name="";
   my $top_row;
   my $end_row;
   my $grid_ref;
-  my $counter;
-  my $month;
   my $month_counter=0;
   my $last_patch_total;
   # Insert Environment header
@@ -1889,15 +2138,13 @@ sub generate_env_totals {
       if ($worksheet_name=~/[0-9]/) {
         foreach $env_name (@env_names) {
           $month_counter=0;
-          ($key_row,$key_col,$last_patch_total,$month_counter)=generate_env_monthly_totals($key_row,$key_col,$last_patch_total,$month_counter,$date_string,$env_name),"";
+          ($key_row,$key_col,$last_patch_total,$month_counter)=generate_env_monthly_totals($key_row,$key_col,$last_patch_total,$month_counter,$date_string,$env_name,"");
         }
       }
       else {
-        $month_counter=0;
-        for ($counter=1;$counter<13;$counter++) {
-          $month=Time::Piece->strptime($counter,'%m');
-          $date_string=$month->monname;
-          foreach $env_name (@env_names) {
+        foreach $env_name (@env_names) {
+          $month_counter=0;
+          foreach $date_string (get_report_periods()) {
             ($key_row,$key_col,$last_patch_total,$month_counter)=generate_env_monthly_totals($key_row,$key_col,$last_patch_total,$month_counter,$date_string,$env_name,"");
           }
         }
@@ -1906,9 +2153,7 @@ sub generate_env_totals {
     else {
       if ($worksheet_name=~/PCI/) {
         $month_counter=0;
-        for ($counter=1;$counter<13;$counter++) {
-          $month=Time::Piece->strptime($counter,'%m');
-          $date_string=$month->monname;
+        foreach $date_string (get_report_periods()) {
           ($key_row,$key_col,$last_patch_total,$month_counter)=generate_env_monthly_totals($key_row,$key_col,$last_patch_total,$month_counter,$date_string,"PCI","");
         }
       }
@@ -1917,9 +2162,7 @@ sub generate_env_totals {
           if ($worksheet_name=~/$os_name/) {
             foreach $env_name (@env_names) {
               $month_counter=0;
-              for ($counter=1;$counter<13;$counter++) {
-                $month=Time::Piece->strptime($counter,'%m');
-                $date_string=$month->monname;
+              foreach $date_string (get_report_periods()) {
                 ($key_row,$key_col,$last_patch_total,$month_counter)=generate_env_monthly_totals($key_row,$key_col,$last_patch_total,$month_counter,$date_string,$env_name,$os_name);
               }
             }
@@ -1939,9 +2182,7 @@ sub generate_env_totals {
           if ($worksheet_name=~/$os_name/) {
             foreach $env_name (@env_names) {
               $month_counter=0;
-              for ($counter=1;$counter<13;$counter++) {
-                $month=Time::Piece->strptime($counter,'%m');
-                $date_string=$month->monname;
+              foreach $date_string (get_report_periods()) {
                 ($key_row,$key_col,$last_patch_total,$month_counter)=generate_env_monthly_totals($key_row,$key_col,$last_patch_total,$month_counter,$date_string,$env_name,$os_name);
               }
             }
@@ -1977,13 +2218,8 @@ sub generate_speadsheet {
   my $key_col;
   my $key_row;
   my $worksheet_name;
-  my $top_row;
-  my $end_row;
-  my $grid_ref;
   my $file_name;
   my $no_patches;
-  my $month;
-  my $section_name;
   my $date_string;
   my $host_name;
   my $env_name;
@@ -1996,27 +2232,28 @@ sub generate_speadsheet {
   my $code;
   my $exclude;
   my $pattern;
-  my $command;
+  my $file_pattern;
   my $reason;
   my $comment;
   my $patch_info;
-  my $year_string=`date +%Y`;
-  chomp($year_string);
-  $command=create_speadsheet();
+  my $report_year;
+  my $period;
+  $file_pattern=create_speadsheet();
   if ($option{'v'}) {
     print "Generating $xlsx_file\n";
   }
   create_cover_sheet();
-  @file_list=`$command`;
+  @file_list=sort { report_file_order($a,$b) } find_files($cpr_dir,$file_pattern);
   foreach $file_name (@file_list) {
-    chomp($file_name);
     $file_size=-s $file_name;
     if (($file_name=~/[a-z]/)&&($file_size != 0)) {
       $col=0;
       $row=0;
       $key_row=1;
       $key_col=6;
-      ($worksheet_name,$date_string)=generate_worksheet_name($file_name);
+      ($worksheet_name,$date_string,$report_year)=generate_worksheet_name($file_name);
+      # Totals are keyed on month and year so that the same month in different years is kept apart
+      $period=(defined($date_string)&&($date_string ne ""))?"$date_string $report_year":"";
       $worksheet=$workbook->add_worksheet($worksheet_name);
       if ($option{'S'}) {
         if ($worksheet_name!~/All Platforms/) {
@@ -2054,17 +2291,18 @@ sub generate_speadsheet {
         $patch_info=$data[4];
         if ($os_name=~/Solaris/) {
           if ($worksheet_name=~/[0-9]/) {
-            $patch_info="$pca_url/$date_string$year_string/$host_name"."."."$patch_info"."."."html";
+            $patch_info="$pca_url/$date_string$report_year/$host_name"."."."$patch_info"."."."html";
           }
           else {
             $patch_info="$pca_url/latest/$host_name"."."."$patch_info"."."."html";
           }
         }
         $check_date=$data[5];
-        if ($env_name!~/[A-z]/) {
+        if ($env_name!~/[A-Za-z]/) {
           $env_name=get_environment($host_name);
         }
-        if (($exclude) = grep /$host_name,/, @exc_hosts) {
+        $exclude=get_exclusion($host_name);
+        if ($exclude ne "") {
           @data=split(/,/,$exclude);
           $reason=$data[1];
           $exclude=1;
@@ -2074,18 +2312,21 @@ sub generate_speadsheet {
         else {
           $exclude=0;
           $pattern=1;
-          if (($comment) = grep /$host_name,/, @cmdb_list) {
+          if (($comment) = grep { /^\Q$host_name\E,/ } @cmdb_list) {
             @data=split(/,/,$comment);
             $comment=$data[3];
-            if ($comment=~/[A-z]/) {
+            if ($comment=~/[A-Za-z]/) {
               $worksheet->write_comment($row,$col,$comment);
             }
           }
         }
         if ($worksheet_name!~/All/) {
           if ($exclude == 0) {
-            $line="$line,$date_string";
-            push(@patch_info,$line);
+            $line="$line,$period";
+            # PCI hosts appear in both the platform and PCI files, only count them once
+            if (!$patch_seen{$line}++) {
+              push(@patch_info,$line);
+            }
           }
         }
         $format=$workbook->add_format(bg_color => 'white', border => 2, pattern => $pattern);
@@ -2123,7 +2364,7 @@ sub generate_speadsheet {
         # Write Outstanding patches
         $format=$workbook->add_format(bg_color => $code, border => 2, align => 'right', pattern => $pattern);
         $worksheet->write($row,$col,$no_patches,$format);
-        if ($patch_info=~/[A-z]/) {
+        if ($patch_info=~/[A-Za-z]/) {
           $worksheet->write_comment($row,$col,$patch_info);
         }
         $format=$workbook->add_format(bg_color => 'white', border => 2, pattern => $pattern);
@@ -2136,9 +2377,9 @@ sub generate_speadsheet {
       # Create Totals Header
       ($key_row,$key_col)=create_totals_header($key_row,$key_col);
       # Generate Plaform summary
-      ($key_row,$key_col)=generate_platform_totals($key_row,$key_col,$date_string,$os_name,$worksheet_name);
+      ($key_row,$key_col)=generate_platform_totals($key_row,$key_col,$period,$os_name,$worksheet_name);
       # Generate Environment summary
-      ($key_row,$key_col)=generate_env_totals($key_row,$key_col,$date_string,$env_name,$worksheet_name);
+      ($key_row,$key_col)=generate_env_totals($key_row,$key_col,$period,$env_name,$worksheet_name);
     }
   }
   $workbook->close();
@@ -2152,12 +2393,15 @@ sub generate_speadsheet {
 #
 
 sub import_pca_data {
+  @pca_data=();
+  if (! -e "$pca_html") {
+    return;
+  }
   my $html=HTML::TokeParser->new(shift||"$pca_html");
   my $token;
   my $text;
-  my $line;
-  my $string;
-  my $host_name;
+  my $string="";
+  my $host_name="";
   my $counter=0;
   # Process every TD tag
   while ($token=$html->get_tag("td")) {
